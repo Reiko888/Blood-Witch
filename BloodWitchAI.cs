@@ -132,6 +132,7 @@ namespace BloodWitch
         public AudioClip boilTarget2DSFX;
         public AudioClip teleportSFX;
         public AudioClip consumeBloodSFX;
+        public AudioClip transformationSFX;
         public AudioClip stabSFX;
         public AudioSource daggerAudioSource;
         public AudioSource breathingAudioSource;
@@ -141,6 +142,11 @@ namespace BloodWitch
         public GameObject grannyModelContainer;
 
         public GameObject monsterModelContainer;
+
+        public GameObject portalPrefab;
+        public AudioClip portalStartSFX;
+        public AudioClip portalCloseSFX;
+        public GameObject[] level2EyeEffects;
 
         public ParticleSystem BloodSpurtParticleArmL;
         public ParticleSystem BloodSpurtParticleArmR;
@@ -168,7 +174,12 @@ namespace BloodWitch
         private float geyserCooldown = 0f;
         private bool hasStartedTransformation = false;
         private bool isCurrentlyTransforming = false;
+        private bool isWaitingForLevelUp = false;
         private bool isPausedAfterAttack = false;
+        private bool isWalkingIntoPortal = false;
+        
+        private EntranceTeleport[] allTeleports;
+        private float doorTransitionCooldown = 0f;
 
         private static FieldInfo currentBloodIndexField = typeof(PlayerControllerB).GetField("currentBloodIndex", BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -255,11 +266,20 @@ namespace BloodWitch
                     }
                 }
             }
+
+            if (level2EyeEffects != null)
+            {
+                foreach (var eye in level2EyeEffects)
+                {
+                    if (eye != null) eye.SetActive(level >= 2);
+                }
+            }
         }
 
         public override void Start()
         {
             base.Start();
+            updatePositionThreshold = 0.5f;
             ApplyLevelMaterials(CurrentLevel);
             
             if (footprintPrefab != null)
@@ -346,9 +366,13 @@ namespace BloodWitch
 
         public override void DoAIInterval()
         {
-            if (isEnemyDead || StartOfRound.Instance.allPlayersDead || isCurrentlyTransforming || isPausedAfterAttack || isConsumingBlood)
+            if (isEnemyDead || StartOfRound.Instance.allPlayersDead || isCurrentlyTransforming || isPausedAfterAttack || stunNormalizedTimer > 0f || isWalkingIntoPortal)
                 return;
-            base.DoAIInterval();
+                
+            if (!isConsumingBlood)
+            {
+                base.DoAIInterval();
+            }
 
             bool oldLOS = hasLOS;
             int level = CurrentLevel;
@@ -372,6 +396,8 @@ namespace BloodWitch
                 }
             }
 
+            if (isConsumingBlood) return;
+
             if (IsServer && agent != null)
             {
                 switch ((State)currentBehaviourStateIndex)
@@ -384,13 +410,32 @@ namespace BloodWitch
                         agent.speed = 4f; // Faster in level 3
                         break;
                     case State.MonsterLevel4:
-                        agent.speed = 2f; // Fast blood beast starts slow
+                        agent.speed = 4f; // Fast blood beast starts slow
                         break;
                 }
             }
 
             if (targetPlayer != null && !isConsumingBlood)
             {
+                if (level == 4 && targetPlayer.isInsideFactory == this.isOutside)
+                {
+                    movingTowardsTargetPlayer = false;
+                    EntranceTeleport chaserDoor = GetClosestDoorToMonster();
+                    if (chaserDoor != null)
+                    {
+                        SetDestinationToPosition(chaserDoor.transform.position, false);
+                        if (Vector3.Distance(transform.position, chaserDoor.transform.position) < 4f && doorTransitionCooldown <= 0f)
+                        {
+                            EntranceTeleport exitDoor = GetCorrespondingDoor(chaserDoor);
+                            if (exitDoor != null)
+                            {
+                                doorTransitionCooldown = 3f;
+                                TeleportEnemyServerRpc(exitDoor.entrancePoint.position, !this.isOutside);
+                            }
+                        }
+                    }
+                    return;
+                }
 
                 if (CheckLineOfSightForPosition(targetPlayer.gameplayCamera.transform.position, 120f, 60))
                 {
@@ -492,6 +537,38 @@ namespace BloodWitch
                 {
                     StartSearch(base.transform.position);
                 }
+
+                if (level == 4 && monsterSeePlayerCooldown <= 0f)
+                {
+                    // 1% chance every AI tick (approx every 0.2s = 5% per second) to play the spotted SFX while wandering
+                    if (UnityEngine.Random.Range(0, 100) < 1)
+                    {
+                        monsterSeePlayerCooldown = 15f; // Wait at least 15 seconds before playing again
+                        if (IsServer) PlayMonsterSeePlayerSFXClientRpc();
+                    }
+                }
+
+                if (level == 4 && doorTransitionCooldown <= 0f)
+                {
+                    EntranceTeleport chaserDoor = GetClosestDoorToMonster();
+                    if (chaserDoor != null && Vector3.Distance(transform.position, chaserDoor.transform.position) < 4f)
+                    {
+                        // 30% chance to go through the door when wandering near it to avoid constant ping-ponging
+                        if (UnityEngine.Random.Range(0, 100) < 30)
+                        {
+                            EntranceTeleport exitDoor = GetCorrespondingDoor(chaserDoor);
+                            if (exitDoor != null)
+                            {
+                                doorTransitionCooldown = 15f;
+                                TeleportEnemyServerRpc(exitDoor.entrancePoint.position, !this.isOutside);
+                            }
+                        }
+                        else
+                        {
+                            doorTransitionCooldown = 5f; // Check again in 5 seconds
+                        }
+                    }
+                }
             }
 
             if (!oldLOS && hasLOS && CurrentLevel == 4 && monsterSeePlayerCooldown <= 0f)
@@ -509,6 +586,34 @@ namespace BloodWitch
             base.Update();
             if (isEnemyDead) return;
 
+            if (stunNormalizedTimer > 0f)
+            {
+                if (creatureAnimator != null && !creatureAnimator.GetBool("hasBeenStunned"))
+                {
+                    creatureAnimator.SetBool("hasBeenStunned", true);
+                }
+                if (IsServer && agent != null && agent.isOnNavMesh)
+                {
+                    agent.isStopped = true;
+                    agent.velocity = Vector3.zero;
+                }
+                return;
+            }
+            else
+            {
+                if (creatureAnimator != null && creatureAnimator.GetBool("hasBeenStunned"))
+                {
+                    creatureAnimator.SetBool("hasBeenStunned", false);
+                    if (IsServer && agent != null && agent.isOnNavMesh)
+                    {
+                        agent.isStopped = false;
+                    }
+                }
+            }
+
+            if (isWalkingIntoPortal) return;
+
+            if (doorTransitionCooldown > 0f) doorTransitionCooldown -= Time.deltaTime;
             if (monsterSeePlayerCooldown > 0f) monsterSeePlayerCooldown -= Time.deltaTime;
 
             if (targetPlayer != null)
@@ -522,7 +627,8 @@ namespace BloodWitch
                 LogIfDebugBuild($"Processing hasTeleported and starting consumption.");
                 hasTeleported = false;
 
-                StartCoroutine(TeleportThenConsumeRoutine());
+                if (consumeCoroutine != null) StopCoroutine(consumeCoroutine);
+                consumeCoroutine = StartCoroutine(TeleportThenConsumeRoutine());
             }
 
             if (currentBehaviourStateIndex == 3)
@@ -539,40 +645,28 @@ namespace BloodWitch
                         currentMonsterSpeed -= Time.deltaTime * 4f; // Slow down if no target
                         agent.acceleration = Mathf.MoveTowards(agent.acceleration, 10f, Time.deltaTime * 8f);
                     }
-                    currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, 2f, 14f);
+                    currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, 2f, 9f);
                     agent.speed = currentMonsterSpeed;
                 }
                 
-                float rawSpeed = (transform.position - previousPosition).magnitude / (Time.deltaTime / 1.4f);
-                
-                if (velocityInterval <= 0f)
-                {
-                    velocityInterval = 0.05f;
-                    velocityAverageCount += 1f;
-                    if (velocityAverageCount > 5f)
-                    {
-                        averageVelocity += (rawSpeed - averageVelocity) / 3f;
-                    }
-                    else
-                    {
-                        averageVelocity += rawSpeed;
-                        if (velocityAverageCount == 2f)
-                        {
-                            averageVelocity /= velocityAverageCount;
-                        }
-                    }
-                }
-                else
-                {
-                    velocityInterval -= Time.deltaTime;
-                }
-                
+                float rawSpeed = (transform.position - previousPosition).magnitude / Time.deltaTime;
+                averageVelocity = Mathf.Lerp(averageVelocity, rawSpeed, Time.deltaTime * 10f);
                 previousPosition = transform.position;
 
-                float speedMult = Mathf.Clamp(averageVelocity / 12f * 2.5f, 0.1f, 3f);
+                float speedMult = Mathf.Clamp(averageVelocity / 4.5f, 0.5f, 4f);
                 if (creatureAnimator != null)
                 {
                     creatureAnimator.SetFloat("monsterSpeedMult", speedMult);
+                }
+                
+                // Use speed multiplyer from monster animator
+                if (monsterModelContainer != null)
+                {
+                    Animator[] animators = monsterModelContainer.GetComponentsInChildren<Animator>(true);
+                    foreach (Animator anim in animators)
+                    {
+                        anim.SetFloat("monsterSpeedMult", speedMult);
+                    }
                 }
             }
 
@@ -582,7 +676,7 @@ namespace BloodWitch
             geyserCooldown -= Time.deltaTime;
             laughCooldown -= Time.deltaTime;
 
-            if (!isEnemyDead && agent != null && agent.isOnNavMesh && currentBehaviourStateIndex != 3)
+            if (!isEnemyDead && agent != null && agent.isOnNavMesh && currentBehaviourStateIndex != 3 && !isWalkingIntoPortal)
             {
                 agent.speed = 3.5f;
             }
@@ -636,33 +730,8 @@ namespace BloodWitch
                     agent.velocity = Vector3.zero;
                 }
                 
-                consumeTimer -= Time.deltaTime;
-                if (consumeTimer <= 0f)
-                {
-                    isConsumingBlood = false;
-                    activeFootprintTimer = 20f;
-                    if (creatureAnimator != null)
-                    {
-                        creatureAnimator.SetTrigger("backToWalk");
-                    }
-                    StartCoroutine(DelayedConsumeBlood(0.5f));
-                    if (IsServer && agent != null)
-                    {
-                        if (agent.isOnNavMesh)
-                        {
-                            agent.isStopped = false;
-                        }
-                    }
-                    if (currentBloodTarget != null && !consumedBloodTargets.Contains(currentBloodTarget))
-                    {
-                        consumedBloodTargets.Add(currentBloodTarget);
-                        currentBloodTarget = null;
-                    }
-                }
-                else
-                {
-                    return; // Pause normal logic while consuming
-                }
+                // Pause normal logic while consuming
+                return;
             }
 
             // Limb Regeneration
@@ -751,11 +820,12 @@ namespace BloodWitch
             }
         }
 
+        private Coroutine consumeCoroutine;
+
         private System.Collections.IEnumerator TeleportThenConsumeRoutine()
         {
             isConsumingBlood = true; // Pauses AI immediately
             movingTowardsTargetPlayer = false;
-            consumeTimer = 999f;
 
             if (IsServer)
             {
@@ -783,14 +853,48 @@ namespace BloodWitch
 
             if (creatureAnimator != null)
             {
-                creatureAnimator.SetTrigger("hasStartedConsume");
+                creatureAnimator.SetBool("isConsuming", true);
             }
             if (consumeBloodSFX != null && creatureVoice != null)
             {
                 creatureVoice.PlayOneShot(consumeBloodSFX);
             }
 
-            consumeTimer = 10f;
+            yield return new WaitForSeconds(consumeDuration - 0.2f);
+
+            if (!isConsumingBlood) yield break; // Was interrupted by HitEnemy
+
+            activeFootprintTimer = 20f;
+                    
+            int tempBlood = bloodConsumed;
+            tempBlood++; // Simulating the next drink
+            bool willTransform = tempBlood >= 9;
+                    
+            // If she IS NOT transforming, let her resume walking normally.
+            if (!willTransform)
+            {
+                isConsumingBlood = false;
+                if (creatureAnimator != null)
+                {
+                    creatureAnimator.SetBool("isConsuming", false);
+                }
+                if (IsServer && agent != null && agent.isOnNavMesh)
+                {
+                    agent.isStopped = false;
+                }
+            }
+            else
+            {
+                // If she IS transforming, leave isConsumingBlood = true so she stays completely frozen
+                isWaitingForLevelUp = true;
+            }
+                    
+            StartCoroutine(DelayedConsumeBlood(0.5f));
+            if (currentBloodTarget != null && !consumedBloodTargets.Contains(currentBloodTarget))
+            {
+                consumedBloodTargets.Add(currentBloodTarget);
+                currentBloodTarget = null;
+            }
         }
 
         private Transform FindBestBloodSource()
@@ -869,16 +973,53 @@ namespace BloodWitch
             
             GameObject closestNode = null;
             float minDistance = float.MaxValue;
+            bool nodeIsOutside = false;
 
-            foreach (GameObject node in allAINodes)
+            if (RoundManager.Instance != null)
             {
-                if (node == null) continue;
-
-                float dist = Vector3.Distance(node.transform.position, bloodLocation);
-                if (dist < minDistance)
+                if (RoundManager.Instance.insideAINodes != null)
                 {
-                    minDistance = dist;
-                    closestNode = node;
+                    foreach (GameObject node in RoundManager.Instance.insideAINodes)
+                    {
+                        if (node == null) continue;
+                        float dist = Vector3.Distance(node.transform.position, bloodLocation);
+                        if (dist < minDistance)
+                        {
+                            minDistance = dist;
+                            closestNode = node;
+                            nodeIsOutside = false;
+                        }
+                    }
+                }
+                
+                if (RoundManager.Instance.outsideAINodes != null)
+                {
+                    foreach (GameObject node in RoundManager.Instance.outsideAINodes)
+                    {
+                        if (node == null) continue;
+                        float dist = Vector3.Distance(node.transform.position, bloodLocation);
+                        if (dist < minDistance)
+                        {
+                            minDistance = dist;
+                            closestNode = node;
+                            nodeIsOutside = true;
+                        }
+                    }
+                }
+            }
+            
+            if (closestNode == null && allAINodes != null)
+            {
+                foreach (GameObject node in allAINodes)
+                {
+                    if (node == null) continue;
+                    float dist = Vector3.Distance(node.transform.position, bloodLocation);
+                    if (dist < minDistance)
+                    {
+                        minDistance = dist;
+                        closestNode = node;
+                        nodeIsOutside = this.isOutside; // Default to current state
+                    }
                 }
             }
 
@@ -889,11 +1030,12 @@ namespace BloodWitch
                 LogIfDebugBuild($"Found closest node at {minDistance} units. Teleporting near blood area.");
                 if (IsServer)
                 {
-                    TeleportBWClientRpc(bloodLocation);
+                    if (portalCoroutine != null) StopCoroutine(portalCoroutine);
+                    portalCoroutine = StartCoroutine(PortalSequenceRoutine(bloodLocation, nodeIsOutside));
                 }
                 else
                 {
-                    TeleportBWServerRpc(bloodLocation);
+                    TeleportBWServerRpc(bloodLocation, nodeIsOutside);
                 }
             }
             else
@@ -902,11 +1044,93 @@ namespace BloodWitch
             }
         }
 
+        private Coroutine portalCoroutine;
+        private GameObject entrancePortal;
+        private GameObject exitPortal;
+
+        [ClientRpc]
+        public void SpawnEntrancePortalClientRpc(Vector3 position, Quaternion rotation)
+        {
+            if (portalPrefab != null)
+            {
+                entrancePortal = Instantiate(portalPrefab, position, rotation);
+                ParticleSystem[] particles = entrancePortal.GetComponentsInChildren<ParticleSystem>();
+                foreach (var p in particles) p.Play();
+            }
+            if (portalStartSFX != null && creatureVoice != null)
+            {
+                creatureVoice.PlayOneShot(portalStartSFX);
+            }
+        }
+
+        [ClientRpc]
+        public void SpawnExitPortalClientRpc(Vector3 position, Quaternion rotation)
+        {
+            if (portalPrefab != null)
+            {
+                exitPortal = Instantiate(portalPrefab, position, rotation);
+                ParticleSystem[] particles = exitPortal.GetComponentsInChildren<ParticleSystem>();
+                foreach (var p in particles) p.Play();
+            }
+        }
+
+        [ClientRpc]
+        public void ClosePortalsClientRpc()
+        {
+            if (portalCloseSFX != null && creatureVoice != null)
+            {
+                creatureVoice.PlayOneShot(portalCloseSFX);
+            }
+            if (entrancePortal != null) Destroy(entrancePortal);
+            if (exitPortal != null) Destroy(exitPortal);
+        }
+
+        private System.Collections.IEnumerator PortalSequenceRoutine(Vector3 bloodLocation, bool setOutside)
+        {
+            isWalkingIntoPortal = true;
+            movingTowardsTargetPlayer = false;
+            
+            if (currentSearch != null && currentSearch.inProgress) StopSearch(currentSearch);
+
+            Vector3 entrancePos = transform.position + transform.forward * 1.5f;
+            entrancePos.y += 2f;
+            
+            SpawnEntrancePortalClientRpc(entrancePos, transform.rotation);
+            
+            Quaternion exitRot = Quaternion.Euler(90f, 0f, 0f);
+            SpawnExitPortalClientRpc(bloodLocation, exitRot);
+
+            float t = 0f;
+            if (agent != null && agent.isOnNavMesh)
+            {
+                agent.isStopped = false;
+                agent.SetDestination(entrancePos);
+                agent.speed = 3f;
+            }
+
+            while (t < 1f)
+            {
+                t += Time.deltaTime;
+                yield return null;
+            }
+            
+            TeleportBWClientRpc(bloodLocation, setOutside);
+            isWalkingIntoPortal = false;
+
+            yield return new WaitForSeconds(1f);
+            ClosePortalsClientRpc();
+        }
+
         //Local
-        private void TeleportBloodWitch(Vector3 bloodLocation)
+        private void TeleportBloodWitch(Vector3 bloodLocation, bool setOutside)
         {
             movingTowardsTargetPlayer = false;
             if (currentSearch != null && currentSearch.inProgress) StopSearch(currentSearch);
+
+            if (this.isOutside != setOutside)
+            {
+                SetEnemyOutside(setOutside);
+            }
 
             if (IsServer && agent != null)
             {
@@ -930,31 +1154,44 @@ namespace BloodWitch
         }
 
         [ServerRpc(RequireOwnership = false)]
-        public void TeleportBWServerRpc(Vector3 bloodLocation)
+        public void TeleportBWServerRpc(Vector3 bloodLocation, bool setOutside)
         {
-            TeleportBWClientRpc(bloodLocation);
+            if (portalCoroutine != null) StopCoroutine(portalCoroutine);
+            portalCoroutine = StartCoroutine(PortalSequenceRoutine(bloodLocation, setOutside));
         }
 
         [ClientRpc]
-        public void TeleportBWClientRpc(Vector3 bloodLocation)
+        public void TeleportBWClientRpc(Vector3 bloodLocation, bool setOutside)
         {
-            TeleportBloodWitch(bloodLocation);
+            TeleportBloodWitch(bloodLocation, setOutside);
             hasTeleported = true;
         }
 
         private System.Collections.IEnumerator TransformationRoutine()
         {
+            isConsumingBlood = false; // Release the freeze lock
+            isWaitingForLevelUp = false;
             isCurrentlyTransforming = true;
-            if (IsServer && agent != null)
+            if (agent != null)
             {
                 agent.speed = 0f;
                 if (agent.isOnNavMesh) agent.isStopped = true;
             }
             if (creatureAnimator != null)
             {
-                creatureAnimator.SetTrigger("isTransforming");
+                creatureAnimator.SetBool("isConsuming", false);
+                creatureAnimator.SetBool("isTransforming", true);
             }
-            yield return new WaitForSeconds(6f);
+            if (transformationSFX != null && creatureVoice != null)
+            {
+                creatureVoice.PlayOneShot(transformationSFX);
+            }
+            yield return new WaitForSeconds(3f);
+            
+            if (BloodSpurtParticleBackL != null) BloodSpurtParticleBackL.Play();
+            if (BloodSpurtParticleBackR != null) BloodSpurtParticleBackR.Play();
+
+            yield return new WaitForSeconds(3f);
             
             if (grannyModelContainer != null) grannyModelContainer.SetActive(false);
             if (monsterModelContainer != null) monsterModelContainer.SetActive(true);
@@ -962,8 +1199,12 @@ namespace BloodWitch
             if (IsServer && agent != null)
             {
                 if (agent.isOnNavMesh) agent.isStopped = false;
-                agent.speed = 2f; // Starts slow
+                agent.speed = 4f; // Starts slow
                 agent.acceleration = 2f; // reset acceleration so it ramps up
+            }
+            if (creatureAnimator != null)
+            {
+                creatureAnimator.SetBool("isTransforming", false);
             }
             isCurrentlyTransforming = false;
         }
@@ -1124,18 +1365,38 @@ namespace BloodWitch
             }
         }
 
+        public override void SetEnemyStunned(bool setToStunned, float setToStunTime = 1f, PlayerControllerB setStunnedByPlayer = null)
+        {
+            if (CurrentLevel == 4) return; // Monster mode is completely invulnerable
+            
+            // Limit stun time to a max of 2.5 seconds to prevent extremely long stuns
+            float adjustedStunTime = Mathf.Min(setToStunTime, 2.5f);
+            
+            base.SetEnemyStunned(setToStunned, adjustedStunTime, setStunnedByPlayer);
+        }
+
         public override void HitEnemy(int force = 1, PlayerControllerB playerWhoHit = null, bool playHitSFX = false, int hitID = -1)
         {
+            if (CurrentLevel == 4) return; // Monster mode is completely invulnerable
+            
             base.HitEnemy(force, playerWhoHit, playHitSFX, hitID);
             if (isEnemyDead) return;
+
+            if (isWalkingIntoPortal)
+            {
+                isWalkingIntoPortal = false;
+                if (portalCoroutine != null) StopCoroutine(portalCoroutine);
+                ClosePortalsClientRpc();
+            }
 
             if (isConsumingBlood)
             {
                 isConsumingBlood = false;
-                consumeTimer = 0f;
+                if (consumeCoroutine != null) StopCoroutine(consumeCoroutine);
+                
                 if (creatureAnimator != null)
                 {
-                    creatureAnimator.SetTrigger("backToWalk");
+                    creatureAnimator.SetBool("isConsuming", false);
                 }
                 if (IsServer && agent != null && agent.isOnNavMesh)
                 {
@@ -1356,6 +1617,9 @@ namespace BloodWitch
                             anim.SetTrigger("MonsterAttack");
                         }
                     }
+
+                    if (IsServer) PlayMonsterAttackSFXClientRpc();
+                    else PlayMonsterAttackSFXServerRpc();
                     
                     StartCoroutine(PauseAfterAttack(3f));
                       
@@ -1440,6 +1704,10 @@ namespace BloodWitch
         public override void KillEnemy(bool destroy = false)
         {
             base.KillEnemy(destroy);
+            if (creatureAnimator != null)
+            {
+                creatureAnimator.SetBool("hasDied", true);
+            }
             if (grannyAudioAnimationEvent != null)
             {
                 grannyAudioAnimationEvent.enableAudio = false;
@@ -1448,6 +1716,17 @@ namespace BloodWitch
             {
                 monsterAudioAnimationEvent.enableAudio = false;
             }
+            if (breathingAudioSource != null) breathingAudioSource.Stop();
+            if (creatureVoice != null) creatureVoice.Stop();
+            if (creatureSFX != null) creatureSFX.Stop();
+            if (boil2DAudioSource != null) boil2DAudioSource.Stop();
+            if (screamAudioSource != null) screamAudioSource.Stop();
+        }
+
+        [ServerRpc(RequireOwnership = false)]
+        public void PlayMonsterAttackSFXServerRpc()
+        {
+            PlayMonsterAttackSFXClientRpc();
         }
 
         [ClientRpc]
@@ -1562,6 +1841,80 @@ namespace BloodWitch
                 return latestBlood.transform.position;
             }
             return null;
+        }
+
+        private EntranceTeleport GetClosestDoorToMonster()
+        {
+            if (allTeleports == null || allTeleports.Length == 0)
+            {
+                allTeleports = FindObjectsOfType<EntranceTeleport>();
+            }
+
+            EntranceTeleport closestDoor = null;
+            float minDist = float.MaxValue;
+
+            foreach (EntranceTeleport door in allTeleports)
+            {
+                if (door.isEntranceToBuilding == this.isOutside)
+                {
+                    float dist = Vector3.Distance(transform.position, door.transform.position);
+                    if (dist < minDist)
+                    {
+                        minDist = dist;
+                        closestDoor = door;
+                    }
+                }
+            }
+            return closestDoor;
+        }
+
+        private EntranceTeleport GetCorrespondingDoor(EntranceTeleport chaserDoor)
+        {
+            if (chaserDoor == null) return null;
+            if (allTeleports == null || allTeleports.Length == 0)
+            {
+                allTeleports = FindObjectsOfType<EntranceTeleport>();
+            }
+
+            foreach (EntranceTeleport door in allTeleports)
+            {
+                if (door.entranceId == chaserDoor.entranceId && door.isEntranceToBuilding != chaserDoor.isEntranceToBuilding)
+                {
+                    return door;
+                }
+            }
+            return null;
+        }
+
+        [ServerRpc]
+        public void TeleportEnemyServerRpc(Vector3 pos, bool setOutside)
+        {
+            TeleportEnemyClientRpc(pos, setOutside);
+        }
+
+        [ClientRpc]
+        public void TeleportEnemyClientRpc(Vector3 pos, bool setOutside)
+        {
+            TeleportEnemyLocally(pos, setOutside);
+        }
+
+        private void TeleportEnemyLocally(Vector3 pos, bool setOutside)
+        {
+            if (agent != null) agent.enabled = false;
+            transform.position = pos;
+            if (agent != null) agent.enabled = true;
+            serverPosition = pos;
+            SetEnemyOutside(setOutside);
+            
+            //FindMainEntrancePosition handles syncing mainEntrancePosition
+            if (RoundManager.Instance != null)
+            {
+                EntranceTeleport door = RoundManager.FindMainEntranceScript(setOutside);
+                if (door != null && door.doorAudios != null && door.doorAudios.Length > 0 && door.entrancePointAudio != null)
+                {
+                    door.entrancePointAudio.PlayOneShot(door.doorAudios[0]);
+                }
+            }
         }
     }
 }
