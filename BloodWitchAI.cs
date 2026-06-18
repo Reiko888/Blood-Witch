@@ -62,6 +62,13 @@ namespace BloodWitch
             public SkinnedMeshRenderer[] renderers;
         }
 
+        private const float MAX_ACCELERATION = 35f;
+        private const float MIN_ACCELERATION = 10f;
+        private const float MONSTER_SPEED_DIVISOR = 4.5f;
+        private const float LINE_OF_SIGHT_DISTANCE = 120f;
+
+        private Animator[] monsterAnimators;
+
         public LimbGroup[] removableLimbs;
 
         public GameObject[] severedLimbPrefabs;
@@ -188,6 +195,8 @@ namespace BloodWitch
         
         private EntranceTeleport[] allTeleports;
         private float doorTransitionCooldown = 0f;
+        private int[] previousPlayerHealths;
+        private List<GameObject> serverPlayerBloodDrops;
 
         private static FieldInfo currentBloodIndexField = typeof(PlayerControllerB).GetField("currentBloodIndex", BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -325,6 +334,11 @@ namespace BloodWitch
             limbHealth = BWContentHandler.Instance.bwAssets.GetConfig<int>("Levels 1-3: Limb health").Value;
             limbRegenDuration = BWContentHandler.Instance.bwAssets.GetConfig<float>("Levels 1-3: Limb regeneration duration").Value;
 
+            if (monsterModelContainer != null)
+            {
+                monsterAnimators = monsterModelContainer.GetComponentsInChildren<Animator>(true);
+            }
+
             updatePositionThreshold = 0.5f;
             ApplyLevelMaterials(CurrentLevel);
             
@@ -407,6 +421,123 @@ namespace BloodWitch
             currentBehaviourStateIndex = newStateIndex;
         }
 
+        private void HandleMonsterSpeed()
+        {
+            if (IsServer && agent != null && agent.isOnNavMesh && !isPausedAfterAttack && !isCurrentlyTransforming)
+            {
+                if (targetPlayer != null && hasLOS)
+                {
+                    currentMonsterSpeed += Time.deltaTime * 2.5f;
+                    agent.acceleration = Mathf.MoveTowards(agent.acceleration, MAX_ACCELERATION, Time.deltaTime * 5f);
+                }
+                else
+                {
+                    currentMonsterSpeed -= Time.deltaTime * 4f; // Slow down if no target
+                    agent.acceleration = Mathf.MoveTowards(agent.acceleration, MIN_ACCELERATION, Time.deltaTime * 8f);
+                }
+                currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, monsterBaseSpeed, monsterMaxSpeed);
+                agent.speed = currentMonsterSpeed;
+            }
+            
+            float rawSpeed = (transform.position - previousPosition).magnitude / Time.deltaTime;
+            averageVelocity = Mathf.Lerp(averageVelocity, rawSpeed, Time.deltaTime * 10f);
+            previousPosition = transform.position;
+
+            float speedMult = Mathf.Clamp(averageVelocity / MONSTER_SPEED_DIVISOR, 0.5f, 4f);
+            if (creatureAnimator != null)
+            {
+                creatureAnimator.SetFloat("monsterSpeedMult", speedMult);
+            }
+            
+            // Use speed multiplyer from monster animator
+            if (monsterAnimators != null)
+            {
+                foreach (Animator anim in monsterAnimators)
+                {
+                    anim.SetFloat("monsterSpeedMult", speedMult);
+                }
+            }
+        }
+
+        private void HandleFootprints()
+        {
+            if (footprintPool != null && footprintTimers != null)
+            {
+                for (int i = 0; i < footprintPool.Length; i++)
+                {
+                    if (footprintTimers[i] > 0f)
+                    {
+                        footprintTimers[i] -= Time.deltaTime;
+                        if (footprintTimers[i] <= 0f && footprintPool[i] != null)
+                        {
+                            footprintPool[i].SetActive(false);
+                        }
+                    }
+                }
+            }
+
+            if (activeFootprintTimer > 0f) activeFootprintTimer -= Time.deltaTime;
+
+            if (activeFootprintTimer > 0f && !isEnemyDead && !isCurrentlyTransforming && !isConsumingBlood && footprintPool != null && footprintPool.Length > 0)
+            {
+                if (previousFootprintPosition == Vector3.zero) previousFootprintPosition = transform.position;
+                
+                float distMoved = Vector3.Distance(transform.position, previousFootprintPosition);
+                accumulatedFootprintDistance += distMoved;
+                previousFootprintPosition = transform.position;
+
+                if (accumulatedFootprintDistance >= footprintDistanceThreshold)
+                {
+                    accumulatedFootprintDistance = 0f;
+                    SpawnFootprint();
+                }
+            }
+            else if (!isConsumingBlood)
+            {
+                previousFootprintPosition = transform.position;
+            }
+        }
+
+        private void HandleLimbRegeneration()
+        {
+            if (removableLimbs == null) return;
+
+            for (int i = 0; i < removableLimbs.Length; i++)
+            {
+                if (isLimbDetached[i])
+                {
+                    limbRegenTimers[i] -= Time.deltaTime;
+                    if (limbRegenTimers[i] <= 0f)
+                    {
+                        isLimbDetached[i] = false;
+
+                        if (i == 0 && bloodOrb != null) bloodOrb.SetActive(true);
+                        if (i == 1 && dagger != null) dagger.SetActive(true);
+                        if (i == 2 && CurrentLevel >= 2 && level2EyeEffects != null)
+                        {
+                            foreach (var eye in level2EyeEffects)
+                            {
+                                if (eye != null) eye.SetActive(true);
+                            }
+                        }
+
+                        if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
+                        {
+                            SetLimbVisibility(i, 1f);
+                        }
+                    }
+                    else
+                    {
+                        if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
+                        {
+                            float progress = limbRegenDuration > 0f ? 1f - (limbRegenTimers[i] / limbRegenDuration) : 1f;
+                            SetLimbVisibility(i, progress);
+                        }
+                    }
+                }
+            }
+        }
+
         public override void DoAIInterval()
         {
             if (isEnemyDead || StartOfRound.Instance.allPlayersDead || isCurrentlyTransforming || isPausedAfterAttack || stunNormalizedTimer > 0f || isWalkingIntoPortal)
@@ -481,7 +612,7 @@ namespace BloodWitch
                     return;
                 }
 
-                if (CheckLineOfSightForPosition(targetPlayer.gameplayCamera.transform.position, 120f, 60))
+                if (CheckLineOfSightForPosition(targetPlayer.gameplayCamera.transform.position, LINE_OF_SIGHT_DISTANCE, 60))
                 {
                     hasLOS = true;
                     lastPosition = targetPlayer.transform.position;
@@ -499,11 +630,9 @@ namespace BloodWitch
                                 LogIfDebugBuild($"Started boiling player {targetPlayer.playerUsername}");
                                 SyncBoilingAnimationClientRpc(true, false);
                             }
-                            lastBoilTime = Time.time;
                         }
 
-                        explosionTimer += (Time.time - lastBoilTime);
-                        lastBoilTime = Time.time;
+                        explosionTimer += AIIntervalTime;
 
                         SyncBoilTargetClientRpc((int)targetPlayer.playerClientId, explosionTimer);
 
@@ -556,7 +685,11 @@ namespace BloodWitch
                     if (chaseTimer <= 0f)
                     {
                         targetPlayer = null;
-                        if (currentSearch == null || !currentSearch.inProgress) StartSearch(base.transform.position);
+                        if (currentSearch == null || !currentSearch.inProgress) 
+                        {
+                            if (this.isOutside) StartSearch(ChooseFarthestNodeFromPosition(base.transform.position).position);
+                            else StartSearch(base.transform.position);
+                        }
                     }
                     else
                     {
@@ -574,7 +707,7 @@ namespace BloodWitch
                 hasLOS = false;
                 explosionTimer = 0f;
 
-                if (TargetClosestPlayer(5f, requireLineOfSight: true, 120f))
+                if (TargetClosestPlayer(5f, requireLineOfSight: true, LINE_OF_SIGHT_DISTANCE))
                 {
                     hasLOS = true;
                     chaseTimer = 10f;
@@ -585,7 +718,8 @@ namespace BloodWitch
                 }
                 else if (currentSearch == null || !currentSearch.inProgress)
                 {
-                    StartSearch(base.transform.position);
+                    if (this.isOutside) StartSearch(ChooseFarthestNodeFromPosition(base.transform.position).position);
+                    else StartSearch(base.transform.position);
                 }
 
                 if (level == 4 && monsterSeePlayerCooldown <= 0f)
@@ -598,7 +732,8 @@ namespace BloodWitch
                     }
                 }
 
-                if (level == 4 && doorTransitionCooldown <= 0f)
+                bool canGoOutside = (level == 4 && canMonstGoOutside) || (level < 4 && canGrannyGoOutside);
+                if (canGoOutside && doorTransitionCooldown <= 0f)
                 {
                     EntranceTeleport chaserDoor = GetClosestDoorToMonster();
                     //if monster walks within 4 units of entrance
@@ -643,6 +778,43 @@ namespace BloodWitch
             }
 
             if (isEnemyDead) return;
+
+            if (IsServer && StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
+            {
+                if (previousPlayerHealths == null || previousPlayerHealths.Length != StartOfRound.Instance.allPlayerScripts.Length)
+                {
+                    previousPlayerHealths = new int[StartOfRound.Instance.allPlayerScripts.Length];
+                    for (int i = 0; i < previousPlayerHealths.Length; i++)
+                    {
+                        if (StartOfRound.Instance.allPlayerScripts[i] != null)
+                            previousPlayerHealths[i] = StartOfRound.Instance.allPlayerScripts[i].health;
+                    }
+                }
+                
+                for (int i = 0; i < StartOfRound.Instance.allPlayerScripts.Length; i++)
+                {
+                    PlayerControllerB p = StartOfRound.Instance.allPlayerScripts[i];
+                    if (p != null)
+                    {
+                        if (p.health < previousPlayerHealths[i] && p.health > 0)
+                        {
+                            GameObject customBlood = new GameObject("NetworkedPlayerBlood");
+                            customBlood.transform.position = p.transform.position;
+                            if (serverPlayerBloodDrops == null) serverPlayerBloodDrops = new List<GameObject>();
+                            serverPlayerBloodDrops.Add(customBlood);
+                        }
+                        else if (p.isPlayerDead && p.health != previousPlayerHealths[i])
+                        {
+                            GameObject customBlood = new GameObject("NetworkedPlayerBlood");
+                            if (p.deadBody != null) customBlood.transform.position = p.deadBody.transform.position;
+                            else customBlood.transform.position = p.transform.position;
+                            if (serverPlayerBloodDrops == null) serverPlayerBloodDrops = new List<GameObject>();
+                            serverPlayerBloodDrops.Add(customBlood);
+                        }
+                        previousPlayerHealths[i] = p.health;
+                    }
+                }
+            }
 
             if (stunNormalizedTimer > 0f)
             {
@@ -691,41 +863,7 @@ namespace BloodWitch
 
             if (currentBehaviourStateIndex == 3) //This is monster level, which works as 0,1,2,3 instead of level int 1,2,3,4
             {
-                if (IsServer && agent != null && agent.isOnNavMesh && !isPausedAfterAttack && !isCurrentlyTransforming)
-                {
-                    if (targetPlayer != null && hasLOS)
-                    {
-                        currentMonsterSpeed += Time.deltaTime * 2.5f;
-                        agent.acceleration = Mathf.MoveTowards(agent.acceleration, 35f, Time.deltaTime * 5f);
-                    }
-                    else
-                    {
-                        currentMonsterSpeed -= Time.deltaTime * 4f; // Slow down if no target
-                        agent.acceleration = Mathf.MoveTowards(agent.acceleration, 10f, Time.deltaTime * 8f);
-                    }
-                    currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, monsterBaseSpeed, monsterMaxSpeed);
-                    agent.speed = currentMonsterSpeed;
-                }
-                
-                float rawSpeed = (transform.position - previousPosition).magnitude / Time.deltaTime;
-                averageVelocity = Mathf.Lerp(averageVelocity, rawSpeed, Time.deltaTime * 10f);
-                previousPosition = transform.position;
-
-                float speedMult = Mathf.Clamp(averageVelocity / 4.5f, 0.5f, 4f);
-                if (creatureAnimator != null)
-                {
-                    creatureAnimator.SetFloat("monsterSpeedMult", speedMult);
-                }
-                
-                // Use speed multiplyer from monster animator
-                if (monsterModelContainer != null)
-                {
-                    Animator[] animators = monsterModelContainer.GetComponentsInChildren<Animator>(true);
-                    foreach (Animator anim in animators)
-                    {
-                        anim.SetFloat("monsterSpeedMult", speedMult);
-                    }
-                }
+                HandleMonsterSpeed();
             }
 
             timeSinceLastAttack += Time.deltaTime;
@@ -742,41 +880,7 @@ namespace BloodWitch
                 agent.speed = 3.5f;
             }
 
-            if (footprintPool != null && footprintTimers != null)
-            {
-                for (int i = 0; i < footprintPool.Length; i++)
-                {
-                    if (footprintTimers[i] > 0f)
-                    {
-                        footprintTimers[i] -= Time.deltaTime;
-                        if (footprintTimers[i] <= 0f && footprintPool[i] != null)
-                        {
-                            footprintPool[i].SetActive(false);
-                        }
-                    }
-                }
-            }
-
-            if (activeFootprintTimer > 0f) activeFootprintTimer -= Time.deltaTime;
-
-            if (activeFootprintTimer > 0f && !isEnemyDead && !isCurrentlyTransforming && !isConsumingBlood && footprintPool != null && footprintPool.Length > 0)
-            {
-                if (previousFootprintPosition == Vector3.zero) previousFootprintPosition = transform.position;
-                
-                float distMoved = Vector3.Distance(transform.position, previousFootprintPosition);
-                accumulatedFootprintDistance += distMoved;
-                previousFootprintPosition = transform.position;
-
-                if (accumulatedFootprintDistance >= footprintDistanceThreshold)
-                {
-                    accumulatedFootprintDistance = 0f;
-                    SpawnFootprint();
-                }
-            }
-            else if (!isConsumingBlood)
-            {
-                previousFootprintPosition = transform.position;
-            }
+            HandleFootprints();
 
             if (isConsumingBlood)
             {
@@ -795,70 +899,7 @@ namespace BloodWitch
                 return;
             }
 
-            // Limb Regeneration
-            if (removableLimbs != null)
-            {
-                for (int i = 0; i < removableLimbs.Length; i++)
-                {
-                    if (isLimbDetached[i])
-                    {
-                        limbRegenTimers[i] -= Time.deltaTime;
-                        if (limbRegenTimers[i] <= 0f)
-                        {
-                            isLimbDetached[i] = false;
-
-                            if (i == 0 && bloodOrb != null) bloodOrb.SetActive(true);
-                            if (i == 1 && dagger != null) dagger.SetActive(true);
-                            if (i == 2 && CurrentLevel >= 2 && level2EyeEffects != null)
-                            {
-                                foreach (var eye in level2EyeEffects)
-                                {
-                                    if (eye != null) eye.SetActive(true);
-                                }
-                            }
-
-                            if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
-                            {
-                                foreach (var r in removableLimbs[i].renderers)
-                                {
-                                    if (r != null && r.materials != null)
-                                    {
-                                        foreach (Material mat in r.materials)
-                                        {
-                                            if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", 0.011f);
-                                            
-                                            Color c = mat.color;
-                                            c.a = 1f;
-                                            mat.color = c;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
-                            {
-                                float progress = limbRegenDuration > 0f ? 1f - (limbRegenTimers[i] / limbRegenDuration) : 1f;
-                                foreach (var r in removableLimbs[i].renderers)
-                                {
-                                    if (r != null && r.materials != null)
-                                    {
-                                        foreach (Material mat in r.materials)
-                                        {
-                                            if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", Mathf.Lerp(1f, 0.011f, progress));
-                                            
-                                            Color c = mat.color;
-                                            c.a = Mathf.Lerp(0f, 1f, progress);
-                                            mat.color = c;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            HandleLimbRegeneration();
             
             bool leftArmSevered = (removableLimbs != null && isLimbDetached != null && isLimbDetached.Length > 0 && isLimbDetached[0]);
             
@@ -969,7 +1010,7 @@ namespace BloodWitch
         private Transform FindBestBloodSource()
         {
             Transform bestSource = null;
-            float closestDistance = float.MaxValue;
+            float closestSqrDistance = float.MaxValue;
             Vector3 myPos = transform.position;
 
             LogIfDebugBuild("FindBestBloodSource: Searching for blood sources...");
@@ -978,10 +1019,10 @@ namespace BloodWitch
             {
                 if (source == null || !source.gameObject.activeInHierarchy) return;
                 if (consumedBloodTargets.Contains(source)) return;
-                float dist = Vector3.Distance(myPos, source.position);
-                if (dist < closestDistance)
+                float sqrDist = (myPos - source.position).sqrMagnitude;
+                if (sqrDist < closestSqrDistance)
                 {
-                    closestDistance = dist;
+                    closestSqrDistance = sqrDist;
                     bestSource = source;
                 }
             }
@@ -1001,6 +1042,14 @@ namespace BloodWitch
                     if (p != null && p.isPlayerDead && p.deadBody != null)
                     {
                         CheckSource(p.deadBody.transform);
+                    }
+                }
+                
+                if (serverPlayerBloodDrops != null)
+                {
+                    foreach (GameObject bloodObj in serverPlayerBloodDrops)
+                    {
+                        if (bloodObj != null) CheckSource(bloodObj.transform);
                     }
                 }
             }
@@ -1029,7 +1078,7 @@ namespace BloodWitch
 
             if (bestSource != null)
             {
-                LogIfDebugBuild($"FindBestBloodSource: Found best source at {bestSource.position} with distance {closestDistance}");
+                LogIfDebugBuild($"FindBestBloodSource: Found best source at {bestSource.position} with squared distance {closestSqrDistance}");
             }
             else
             {
@@ -1044,7 +1093,7 @@ namespace BloodWitch
             if (!canTeleport) return;
             
             GameObject closestNode = null;
-            float minDistance = float.MaxValue;
+            float minSqrDistance = float.MaxValue;
             bool nodeIsOutside = false;
 
             if (RoundManager.Instance != null)
@@ -1054,10 +1103,10 @@ namespace BloodWitch
                     foreach (GameObject node in RoundManager.Instance.insideAINodes)
                     {
                         if (node == null) continue;
-                        float dist = Vector3.Distance(node.transform.position, bloodLocation);
-                        if (dist < minDistance)
+                        float sqrDist = (node.transform.position - bloodLocation).sqrMagnitude;
+                        if (sqrDist < minSqrDistance)
                         {
-                            minDistance = dist;
+                            minSqrDistance = sqrDist;
                             closestNode = node;
                             nodeIsOutside = false;
                         }
@@ -1071,10 +1120,10 @@ namespace BloodWitch
                     foreach (GameObject node in RoundManager.Instance.outsideAINodes)
                     {
                         if (node == null) continue;
-                        float dist = Vector3.Distance(node.transform.position, bloodLocation);
-                        if (dist < minDistance)
+                        float sqrDist = (node.transform.position - bloodLocation).sqrMagnitude;
+                        if (sqrDist < minSqrDistance)
                         {
-                            minDistance = dist;
+                            minSqrDistance = sqrDist;
                             closestNode = node;
                             nodeIsOutside = true;
                         }
@@ -1087,10 +1136,10 @@ namespace BloodWitch
                 foreach (GameObject node in allAINodes)
                 {
                     if (node == null) continue;
-                    float dist = Vector3.Distance(node.transform.position, bloodLocation);
-                    if (dist < minDistance)
+                    float sqrDist = (node.transform.position - bloodLocation).sqrMagnitude;
+                    if (sqrDist < minSqrDistance)
                     {
-                        minDistance = dist;
+                        minSqrDistance = sqrDist;
                         closestNode = node;
                         nodeIsOutside = this.isOutside; // Default to current state
                     }
@@ -1099,9 +1148,7 @@ namespace BloodWitch
 
             if (closestNode != null)
             {
-                if (CurrentLevel == 3) teleportCooldownTimer = Level3TPCooldown;
-                else if (CurrentLevel == 2) teleportCooldownTimer = Level2TPCooldown;
-                else teleportCooldownTimer = Level1TPCooldown;
+                ResetTeleportCooldown(CurrentLevel);
                 chosenTeleportNode = closestNode.transform.position;
                 
                 Vector3 finalTeleportPos = bloodLocation;
@@ -1115,7 +1162,7 @@ namespace BloodWitch
                     finalTeleportPos = closestNode.transform.position;
                 }
 
-                LogIfDebugBuild($"Found closest node at {minDistance} units. Teleporting ontop of blood.");
+                LogIfDebugBuild($"Found closest node at {minSqrDistance} squared units. Teleporting ontop of blood.");
                 if (IsServer)
                 {
                     if (portalCoroutine != null) StopCoroutine(portalCoroutine);
@@ -1321,10 +1368,15 @@ namespace BloodWitch
                 int newLevel = CurrentLevel;
                 ConsumeBloodClientRpc(bloodConsumed, oldLevel, newLevel);
 
-                if (newLevel == 3) teleportCooldownTimer = Level3TPCooldown;
-                else if (newLevel == 2) teleportCooldownTimer = Level2TPCooldown;
-                else teleportCooldownTimer = Level1TPCooldown;
+                ResetTeleportCooldown(newLevel);
             }
+        }
+
+        private void ResetTeleportCooldown(int level)
+        {
+            if (level == 3) teleportCooldownTimer = Level3TPCooldown;
+            else if (level == 2) teleportCooldownTimer = Level2TPCooldown;
+            else teleportCooldownTimer = Level1TPCooldown;
         }
 
         [ClientRpc]
@@ -1375,6 +1427,20 @@ namespace BloodWitch
             else
             {
                 predictedPos += player.playerBodyAnimator.transform.forward * 2f;
+            }
+
+            Transform closestNode = ChooseClosestNodeToPosition(predictedPos);
+            if (closestNode != null)
+            {
+                if (Vector3.Distance(closestNode.position, player.transform.position) <= 10f)
+                {
+                    predictedPos = closestNode.position;
+                }
+                else
+                {
+                    Transform playerNode = ChooseClosestNodeToPosition(player.transform.position);
+                    if (playerNode != null) predictedPos = playerNode.position;
+                }
             }
 
             SpawnGeyserWarningClientRpc(predictedPos);
@@ -1577,23 +1643,28 @@ namespace BloodWitch
             if (limbIndex == 1 && dagger != null) dagger.SetActive(false);
 
             // Play blood spurt particles
-            if (limbIndex == 0 && BloodSpurtParticleArmL != null) BloodSpurtParticleArmL.Play();
-            else if (limbIndex == 1 && BloodSpurtParticleArmR != null) BloodSpurtParticleArmR.Play();
-            else if (limbIndex == 2)
+            switch (limbIndex)
             {
-                if (BloodSpurtParticleHead != null) BloodSpurtParticleHead.Play();
-                if (level2EyeEffects != null)
-                {
-                    foreach (var eye in level2EyeEffects)
+                case 0:
+                    if (BloodSpurtParticleArmL != null) BloodSpurtParticleArmL.Play();
+                    break;
+                case 1:
+                    if (BloodSpurtParticleArmR != null) BloodSpurtParticleArmR.Play();
+                    break;
+                case 2:
+                    if (BloodSpurtParticleHead != null) BloodSpurtParticleHead.Play();
+                    if (level2EyeEffects != null)
                     {
-                        if (eye != null) eye.SetActive(false);
+                        foreach (var eye in level2EyeEffects)
+                        {
+                            if (eye != null) eye.SetActive(false);
+                        }
                     }
-                }
-            }
-            else if (limbIndex == 3)
-            {
-                if (BloodSpurtParticleBackL != null) BloodSpurtParticleBackL.Play();
-                if (BloodSpurtParticleBackR != null) BloodSpurtParticleBackR.Play();
+                    break;
+                case 3:
+                    if (BloodSpurtParticleBackL != null) BloodSpurtParticleBackL.Play();
+                    if (BloodSpurtParticleBackR != null) BloodSpurtParticleBackR.Play();
+                    break;
             }
 
             if (removableLimbs[limbIndex] != null && removableLimbs[limbIndex].renderers != null && removableLimbs[limbIndex].renderers.Length > 0)
@@ -1607,9 +1678,15 @@ namespace BloodWitch
                     if (mc != null) mc.convex = true;
                     
                     Rigidbody rb = severedLimb.GetComponentInChildren<Rigidbody>();
-                    if (rb == null) rb = severedLimb.AddComponent<Rigidbody>();
-                    rb.isKinematic = false;
-                    rb.useGravity = true;
+                    if (rb != null)
+                    {
+                        rb.isKinematic = false;
+                        rb.useGravity = true;
+                    }
+                    else
+                    {
+                        LogIfDebugBuild("Warning: Severed limb prefab is missing a Rigidbody!");
+                    }
 
                     ParticleSystem[] particles = severedLimb.GetComponentsInChildren<ParticleSystem>();
                     foreach (var p in particles) p.Play();
@@ -1620,20 +1697,7 @@ namespace BloodWitch
                     Destroy(severedLimb, 20f);
                 }
 
-                foreach (var r in removableLimbs[limbIndex].renderers)
-                {
-                    if (r != null && r.materials != null)
-                    {
-                        foreach (Material mat in r.materials)
-                        {
-                            if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", 1f);
-                            
-                            Color c = mat.color;
-                            c.a = 0f;
-                            mat.color = c;
-                        }
-                    }
-                }
+                SetLimbVisibility(limbIndex, 0f);
             }
 
             bool allDetached = true;
@@ -1713,6 +1777,7 @@ namespace BloodWitch
             PlayerControllerB player = MeetsStandardPlayerCollisionConditions(other);
             if (player != null && timeSinceLastAttack >= grannyAttackCooldownThreshold)
             {
+                if (CurrentLevel == 4 && isPausedAfterAttack) return;
                 // Index 1 = right arm
                 if (removableLimbs != null && isLimbDetached != null && isLimbDetached.Length > 1 && isLimbDetached[1])
                 {
@@ -1754,14 +1819,11 @@ namespace BloodWitch
                     {
                         creatureAnimator.SetTrigger("MonsterAttack");
                     }
-                    if (monsterModelContainer != null)
-                    {
-                        Animator[] animators = monsterModelContainer.GetComponentsInChildren<Animator>(true);
-                        foreach (Animator anim in animators)
+                    if (monsterAnimators != null)
+                        foreach (Animator anim in monsterAnimators)
                         {
                             anim.SetTrigger("MonsterAttack");
                         }
-                    }
 
                     if (IsServer) PlayMonsterAttackSFXClientRpc();
                     else PlayMonsterAttackSFXServerRpc();
@@ -1833,6 +1895,12 @@ namespace BloodWitch
             PlayStabSFXClientRpc();
         }
 
+        private void PlayRandomClip(AudioClip[] clips, AudioSource source)
+        {
+            if (clips == null || clips.Length == 0 || source == null) return;
+            source.PlayOneShot(clips[UnityEngine.Random.Range(0, clips.Length)]);
+        }
+
         [ClientRpc]
         public void PlayStabSFXClientRpc()
         {
@@ -1843,6 +1911,29 @@ namespace BloodWitch
             if (stabSFX != null && daggerAudioSource != null)
             {
                 daggerAudioSource.PlayOneShot(stabSFX);
+            }
+        }
+
+        private void SetLimbVisibility(int limbIndex, float progress)
+        {
+            if (removableLimbs == null || limbIndex < 0 || limbIndex >= removableLimbs.Length) return;
+            if (removableLimbs[limbIndex] == null || removableLimbs[limbIndex].renderers == null) return;
+
+            foreach (var r in removableLimbs[limbIndex].renderers)
+            {
+                if (r != null && r.materials != null)
+                {
+                    foreach (Material mat in r.materials)
+                    {
+                        if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", Mathf.Lerp(1f, 0.011f, progress));
+                        if (mat.HasProperty("_Color")) 
+                        {
+                            Color c = mat.color;
+                            c.a = Mathf.Lerp(0f, 1f, progress);
+                            mat.color = c;
+                        }
+                    }
+                }
             }
         }
 
@@ -1870,24 +1961,9 @@ namespace BloodWitch
             {
                 for (int i = 0; i < removableLimbs.Length; i++)
                 {
-                    if (isLimbDetached != null && isLimbDetached.Length > i && isLimbDetached[i] && removableLimbs[i] != null && removableLimbs[i].renderers != null)
+                    if (isLimbDetached != null && isLimbDetached.Length > i && isLimbDetached[i])
                     {
-                        foreach (var r in removableLimbs[i].renderers)
-                        {
-                            if (r != null && r.materials != null)
-                            {
-                                foreach (Material mat in r.materials)
-                                {
-                                    if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", 1f);
-                                    if (mat.HasProperty("_Color")) 
-                                    {
-                                        Color c = mat.color;
-                                        c.a = 0f;
-                                        mat.color = c;
-                                    }
-                                }
-                            }
-                        }
+                        SetLimbVisibility(i, 0f);
                     }
                 }
             }
@@ -1905,7 +1981,7 @@ namespace BloodWitch
         {
             if (monsterAttackSFX != null && monsterAttackSFX.Length > 0 && creatureSFX != null)
             {
-                creatureSFX.PlayOneShot(monsterAttackSFX[UnityEngine.Random.Range(0, monsterAttackSFX.Length)]);
+                PlayRandomClip(monsterAttackSFX, creatureSFX);
             }
         }
 
@@ -1920,7 +1996,7 @@ namespace BloodWitch
         {
             if (monsterHitPlayerSFX != null && monsterHitPlayerSFX.Length > 0 && creatureSFX != null)
             {
-                creatureSFX.PlayOneShot(monsterHitPlayerSFX[UnityEngine.Random.Range(0, monsterHitPlayerSFX.Length)]);
+                PlayRandomClip(monsterHitPlayerSFX, creatureSFX);
             }
         }
 
@@ -1929,7 +2005,7 @@ namespace BloodWitch
         {
             if (monsterSeePlayerSFX != null && monsterSeePlayerSFX.Length > 0 && creatureVoice != null)
             {
-                creatureVoice.PlayOneShot(monsterSeePlayerSFX[UnityEngine.Random.Range(0, monsterSeePlayerSFX.Length)]);
+                PlayRandomClip(monsterSeePlayerSFX, creatureVoice);
             }
         }
 
@@ -1938,7 +2014,7 @@ namespace BloodWitch
         {
             if (hitSFX != null && hitSFX.Length > 0 && creatureVoice != null)
             {
-                creatureVoice.PlayOneShot(hitSFX[UnityEngine.Random.Range(0, hitSFX.Length)]);
+                PlayRandomClip(hitSFX, creatureVoice);
             }
         }
 
@@ -2004,12 +2080,19 @@ namespace BloodWitch
             {
                 return null;
             }
-            int nextIndex = (int)currentBloodIndexField.GetValue(player);
-            int latestIndex = (nextIndex - 1 + bloodObjects.Count) % bloodObjects.Count;
-            GameObject latestBlood = bloodObjects[latestIndex];
-            if (latestBlood != null && latestBlood.activeSelf)
+            try
             {
-                return latestBlood.transform.position;
+                int nextIndex = (int)currentBloodIndexField.GetValue(player);
+                int latestIndex = (nextIndex - 1 + bloodObjects.Count) % bloodObjects.Count;
+                GameObject latestBlood = bloodObjects[latestIndex];
+                if (latestBlood != null && latestBlood.activeSelf)
+                {
+                    return latestBlood.transform.position;
+                }
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Logger?.LogError($"Error retrieving player's currentBloodIndex: {e.Message}");
             }
             return null;
         }
