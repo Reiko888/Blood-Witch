@@ -92,7 +92,7 @@ namespace BloodWitch
             SpawnPersistentBlood(__instance);
         }
 
-        private static void SpawnPersistentBlood(PlayerControllerB __instance)
+        public static void SpawnPersistentBlood(PlayerControllerB __instance)
         {
             if (__instance == null || __instance.isPlayerDead) return;
 
@@ -126,6 +126,22 @@ namespace BloodWitch
                         UnityEngine.Object.Destroy(bloodDrop);
                         bloodDrop = null;
                     }
+                }
+            }
+
+            // Fallback for server if playerBloodPooledObjects is empty (which happens for non-host players)
+            // This allows the server to track the coordinates without needing the visual decal.
+            if (bloodDrop == null)
+            {
+                bloodDrop = new GameObject("PlayerPersistentBloodDrop_" + __instance.playerUsername);
+                Ray interactRay = new Ray(__instance.transform.position + Vector3.up * 1f, Vector3.down);
+                if (Physics.Raycast(interactRay, out RaycastHit hit, 6f, StartOfRound.Instance.collidersAndRoomMaskAndDefault, QueryTriggerInteraction.Ignore))
+                {
+                    bloodDrop.transform.position = hit.point + Vector3.up * 0.05f;
+                }
+                else
+                {
+                    bloodDrop.transform.position = __instance.transform.position;
                 }
             }
 

@@ -23,6 +23,8 @@ namespace BloodWitch
 
     public class BloodWitchAI : EnemyAI
     {
+        private Dictionary<ulong, int> previousPlayerHealths = new Dictionary<ulong, int>();
+
         [Header("Material Swaps")]
         public LevelMaterialSwap[] grannyMaterialSwaps;
 
@@ -195,8 +197,6 @@ namespace BloodWitch
         
         private EntranceTeleport[] allTeleports;
         private float doorTransitionCooldown = 0f;
-        private int[] previousPlayerHealths;
-        private List<GameObject> serverPlayerBloodDrops;
 
         private static FieldInfo currentBloodIndexField = typeof(PlayerControllerB).GetField("currentBloodIndex", BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -771,6 +771,41 @@ namespace BloodWitch
         {
             base.Update();
             
+            if (IsServer && StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
+            {
+                foreach (PlayerControllerB player in StartOfRound.Instance.allPlayerScripts)
+                {
+                    if (player != null && !player.isPlayerDead)
+                    {
+                        if (!previousPlayerHealths.ContainsKey(player.playerClientId))
+                        {
+                            previousPlayerHealths[player.playerClientId] = player.health;
+                        }
+                        else
+                        {
+                            if (player.health < previousPlayerHealths[player.playerClientId])
+                            {
+                                Vector3 randomDirection = UnityEngine.Random.onUnitSphere;
+                                randomDirection.y = Mathf.Abs(randomDirection.y); 
+                                player.DropBlood(randomDirection, leaveBlood: true, leaveFootprint: false);
+                                
+                                BloodWitch.PlayerBloodPatch.SpawnPersistentBlood(player);
+                                
+                                previousPlayerHealths[player.playerClientId] = player.health;
+                            }
+                            else if (player.health > previousPlayerHealths[player.playerClientId])
+                            {
+                                previousPlayerHealths[player.playerClientId] = player.health;
+                            }
+                        }
+                    }
+                    else if (player != null && player.isPlayerDead)
+                    {
+                        previousPlayerHealths[player.playerClientId] = 100;
+                    }
+                }
+            }
+
             if (StartOfRound.Instance != null && StartOfRound.Instance.shipIsLeaving && !isShipLeavingHandled)
             {
                 isShipLeavingHandled = true;
@@ -778,43 +813,6 @@ namespace BloodWitch
             }
 
             if (isEnemyDead) return;
-
-            if (IsServer && StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
-            {
-                if (previousPlayerHealths == null || previousPlayerHealths.Length != StartOfRound.Instance.allPlayerScripts.Length)
-                {
-                    previousPlayerHealths = new int[StartOfRound.Instance.allPlayerScripts.Length];
-                    for (int i = 0; i < previousPlayerHealths.Length; i++)
-                    {
-                        if (StartOfRound.Instance.allPlayerScripts[i] != null)
-                            previousPlayerHealths[i] = StartOfRound.Instance.allPlayerScripts[i].health;
-                    }
-                }
-                
-                for (int i = 0; i < StartOfRound.Instance.allPlayerScripts.Length; i++)
-                {
-                    PlayerControllerB p = StartOfRound.Instance.allPlayerScripts[i];
-                    if (p != null)
-                    {
-                        if (p.health < previousPlayerHealths[i] && p.health > 0)
-                        {
-                            GameObject customBlood = new GameObject("NetworkedPlayerBlood");
-                            customBlood.transform.position = p.transform.position;
-                            if (serverPlayerBloodDrops == null) serverPlayerBloodDrops = new List<GameObject>();
-                            serverPlayerBloodDrops.Add(customBlood);
-                        }
-                        else if (p.isPlayerDead && p.health != previousPlayerHealths[i])
-                        {
-                            GameObject customBlood = new GameObject("NetworkedPlayerBlood");
-                            if (p.deadBody != null) customBlood.transform.position = p.deadBody.transform.position;
-                            else customBlood.transform.position = p.transform.position;
-                            if (serverPlayerBloodDrops == null) serverPlayerBloodDrops = new List<GameObject>();
-                            serverPlayerBloodDrops.Add(customBlood);
-                        }
-                        previousPlayerHealths[i] = p.health;
-                    }
-                }
-            }
 
             if (stunNormalizedTimer > 0f)
             {
@@ -1027,7 +1025,7 @@ namespace BloodWitch
                 }
             }
 
-            if (canUsePlayerBlood && StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
+            if (StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
             {
                 foreach (PlayerControllerB p in StartOfRound.Instance.allPlayerScripts)
                 {
@@ -1039,30 +1037,33 @@ namespace BloodWitch
                         }
                     }
                     
-                    if (p != null && p.isPlayerDead && p.deadBody != null)
+                if (p != null && p.isPlayerDead && p.deadBody != null)
                     {
                         CheckSource(p.deadBody.transform);
                     }
                 }
-                
-                if (serverPlayerBloodDrops != null)
+            }
+
+            if (EnemyBloodPatch.enemyBloodDrops != null)
+            {
+                foreach (GameObject drop in EnemyBloodPatch.enemyBloodDrops)
                 {
-                    foreach (GameObject bloodObj in serverPlayerBloodDrops)
+                    if (drop == null) continue;
+                    
+                    if (drop.name.StartsWith("PlayerPersistentBloodDrop"))
                     {
-                        if (bloodObj != null) CheckSource(bloodObj.transform);
+                        CheckSource(drop.transform);
+                    }
+                    else if (drop.name.StartsWith("EnemyBloodDrop"))
+                    {
+                        CheckSource(drop.transform);
                     }
                 }
             }
 
             if (canUseEnemyBlood)
             {
-                if (EnemyBloodPatch.enemyBloodDrops != null)
-                {
-                    foreach (GameObject eBlood in EnemyBloodPatch.enemyBloodDrops)
-                    {
-                        if (eBlood != null) CheckSource(eBlood.transform);
-                    }
-                }
+                // Note: EnemyBloodPatch.enemyBloodDrops is now handled in the unified loop above
 
                 if (RoundManager.Instance != null && RoundManager.Instance.SpawnedEnemies != null)
                 {
@@ -1222,6 +1223,33 @@ namespace BloodWitch
             }
             if (entrancePortal != null) Destroy(entrancePortal);
             if (exitPortal != null) Destroy(exitPortal);
+        }
+
+        [ClientRpc]
+        public void CancelInterruptibleActionsClientRpc()
+        {
+            if (isWalkingIntoPortal)
+            {
+                isWalkingIntoPortal = false;
+                if (portalCoroutine != null) StopCoroutine(portalCoroutine);
+                if (entrancePortal != null) Destroy(entrancePortal);
+                if (exitPortal != null) Destroy(exitPortal);
+            }
+
+            if (isConsumingBlood)
+            {
+                isConsumingBlood = false;
+                if (consumeCoroutine != null) StopCoroutine(consumeCoroutine);
+            }
+
+            if (creatureAnimator != null)
+            {
+                creatureAnimator.SetBool("isConsuming", false);
+            }
+            if (creatureVoice != null)
+            {
+                creatureVoice.Stop();
+            }
         }
 
         private System.Collections.IEnumerator PortalSequenceRoutine(Vector3 bloodLocation, bool setOutside)
@@ -1558,7 +1586,7 @@ namespace BloodWitch
             {
                 isWalkingIntoPortal = false;
                 if (portalCoroutine != null) StopCoroutine(portalCoroutine);
-                ClosePortalsClientRpc();
+                if (IsServer) ClosePortalsClientRpc();
             }
 
             if (isConsumingBlood)
@@ -1566,14 +1594,25 @@ namespace BloodWitch
                 isConsumingBlood = false;
                 if (consumeCoroutine != null) StopCoroutine(consumeCoroutine);
                 
-                if (creatureAnimator != null)
-                {
-                    creatureAnimator.SetBool("isConsuming", false);
-                }
                 if (IsServer && agent != null && agent.isOnNavMesh)
                 {
                     agent.isStopped = false;
+                    agent.speed = 4f;
                 }
+            }
+            
+            if (creatureAnimator != null)
+            {
+                creatureAnimator.SetBool("isConsuming", false);
+            }
+            if (creatureVoice != null)
+            {
+                creatureVoice.Stop();
+            }
+
+            if (IsServer)
+            {
+                CancelInterruptibleActionsClientRpc();
             }
 
             if (playerWhoHit != null && IsServer)
@@ -1775,7 +1814,7 @@ namespace BloodWitch
             if (isEnemyDead || isConsumingBlood) return;
 
             PlayerControllerB player = MeetsStandardPlayerCollisionConditions(other);
-            if (player != null && timeSinceLastAttack >= grannyAttackCooldownThreshold)
+            if (player != null && timeSinceLastAttack >= 1f)
             {
                 if (CurrentLevel == 4 && isPausedAfterAttack) return;
                 // Index 1 = right arm
