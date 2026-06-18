@@ -129,19 +129,15 @@ namespace BloodWitch
                 }
             }
 
-            // Fallback for server if playerBloodPooledObjects is empty (which happens for non-host players)
-            // This allows the server to track the coordinates without needing the visual decal.
-            if (bloodDrop == null)
+            if (bloodDrop != null && __instance == GameNetworkManager.Instance.localPlayerController)
             {
-                bloodDrop = new GameObject("PlayerPersistentBloodDrop_" + __instance.playerUsername);
-                Ray interactRay = new Ray(__instance.transform.position + Vector3.up * 1f, Vector3.down);
-                if (Physics.Raycast(interactRay, out RaycastHit hit, 6f, StartOfRound.Instance.collidersAndRoomMaskAndDefault, QueryTriggerInteraction.Ignore))
+                BloodWitchAI[] witches = UnityEngine.Object.FindObjectsOfType<BloodWitchAI>();
+                foreach (BloodWitchAI witch in witches)
                 {
-                    bloodDrop.transform.position = hit.point + Vector3.up * 0.05f;
-                }
-                else
-                {
-                    bloodDrop.transform.position = __instance.transform.position;
+                    if (witch != null)
+                    {
+                        witch.AddBloodSourceServerRpc(bloodDrop.transform.position, __instance.playerUsername);
+                    }
                 }
             }
 

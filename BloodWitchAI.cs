@@ -1327,6 +1327,15 @@ namespace BloodWitch
             portalCoroutine = StartCoroutine(PortalSequenceRoutine(bloodLocation, setOutside));
         }
 
+        [ServerRpc(RequireOwnership = false)]
+        public void AddBloodSourceServerRpc(Vector3 bloodPosition, string playerUsername)
+        {
+            GameObject dummyBlood = new GameObject("PlayerPersistentBloodDrop_" + playerUsername);
+            dummyBlood.transform.position = bloodPosition;
+            EnemyBloodPatch.enemyBloodDrops.Add(dummyBlood);
+            Destroy(dummyBlood, 60f);
+        }
+
         [ClientRpc]
         public void TeleportBWClientRpc(Vector3 bloodLocation, bool setOutside)
         {
