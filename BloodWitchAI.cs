@@ -1,3 +1,4 @@
+using Dusk;
 using GameNetcodeStuff;
 using System.Collections;
 using System.Collections.Generic;
@@ -47,7 +48,7 @@ namespace BloodWitch
 
         private float teleportCooldownTimer;
 
-        public float teleportCooldown = 15f;
+        //public float teleportCooldown = 15f;
 
         private Vector3 lastPosition;
 
@@ -67,7 +68,7 @@ namespace BloodWitch
 
         private float[] limbRegenTimers;
 
-        public float limbRegenDuration = 10f;
+        private float limbRegenDuration;
 
         private bool[] isLimbDetached;
 
@@ -76,7 +77,7 @@ namespace BloodWitch
         private float consumeTimer = 0f;
         private Vector3 consumptionLockPosition;
 
-        public float consumeDuration = 10f;
+        private float consumeDuration;
 
         public Transform currentBloodTarget;
 
@@ -127,16 +128,19 @@ namespace BloodWitch
         public AudioClip[] laughingClips;
         public AudioClip[] level3LaughingClips;
         public AudioClip[] levelUpScreams;
+        public AudioClip[] levelUpScreamsDistant;
         private float laughCooldown = 0f;
         public AudioClip bloodExplosionSFX;
         public AudioClip boilTarget2DSFX;
         public AudioClip teleportSFX;
         public AudioClip consumeBloodSFX;
         public AudioClip transformationSFX;
+        public AudioClip transformationSFXDistant;
         public AudioClip stabSFX;
         public AudioSource daggerAudioSource;
         public AudioSource breathingAudioSource;
         public AudioSource screamAudioSource;
+        public AudioSource distantScreamAudioSource;
         private AudioSource boil2DAudioSource;
 
         public GameObject grannyModelContainer;
@@ -155,6 +159,7 @@ namespace BloodWitch
         public ParticleSystem BloodSpurtParticleBackR;
 
         private float timeSinceLastAttack;
+        private bool isShipLeavingHandled = false;
 
         public int bloodConsumed = 0;
         
@@ -162,16 +167,19 @@ namespace BloodWitch
         {
             get 
             {
-                if (bloodConsumed >= 9) return 4;
-                if (bloodConsumed >= 6) return 3;
-                if (bloodConsumed >= 3) return 2;
+                if (bloodConsumed >= Level3ConsumeReq) return 4;
+                if (bloodConsumed >= Level2ConsumeReq) return 3;
+                if (bloodConsumed >= Level1ConsumeReq) return 2;
                 return 1;
             }
         }
 
         private float explosionTimer = 0f;
-        public float explosionThreshold = 5f;
-        private float geyserCooldown = 0f;
+        private float lastBoilTime = 0f;
+        private float explosionThreshold = 5f;
+        private float geyserCooldown;
+        private float geyserCooldownThreshold;
+        private float grannyAttackCooldownThreshold;
         private bool hasStartedTransformation = false;
         private bool isCurrentlyTransforming = false;
         private bool isWaitingForLevelUp = false;
@@ -183,6 +191,23 @@ namespace BloodWitch
 
         private static FieldInfo currentBloodIndexField = typeof(PlayerControllerB).GetField("currentBloodIndex", BindingFlags.NonPublic | BindingFlags.Instance);
 
+        //Config variables
+        private int Level1TPCooldown;
+        private int Level2TPCooldown;
+        private int Level3TPCooldown;
+        private int Level1ConsumeReq;
+        private int Level2ConsumeReq;
+        private int Level3ConsumeReq;
+        private bool canUseEnemyBlood;
+        private bool canUsePlayerBlood;
+        private bool canMonstGoOutside;
+        private bool canGrannyGoOutside;
+        private int granny1to2base;
+        private int granny3base;
+        private int monsterBaseSpeed;
+        private int monsterMaxSpeed;
+        private int limbHealth;
+        private int currentLimbDamage = 0;
 
 
 
@@ -279,6 +304,27 @@ namespace BloodWitch
         public override void Start()
         {
             base.Start();
+            Level1TPCooldown= BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 1: Teleport cooldown").Value;
+            consumeDuration = BWContentHandler.Instance.bwAssets.GetConfig<int>("Levels 1-3: Consume blood duration").Value;
+            grannyAttackCooldownThreshold = BWContentHandler.Instance.bwAssets.GetConfig<float>("Levels 1-3: Granny stab attack cooldown").Value;
+            explosionThreshold = BWContentHandler.Instance.bwAssets.GetConfig<float>("Level 3: Player explosion timer").Value;
+            geyserCooldownThreshold = BWContentHandler.Instance.bwAssets.GetConfig<float>("Levels 2: Geyser ability cooldown").Value;
+            Level2TPCooldown = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 2: Teleport cooldown").Value;
+            Level3TPCooldown = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 3: Teleport cooldown").Value;
+            Level1ConsumeReq = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 1: Blood Consumption level up requirement").Value;
+            Level2ConsumeReq = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 2: Blood Consumption level up requirement").Value;
+            Level3ConsumeReq = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 3: Blood Consumption level up requirement").Value;
+            canUseEnemyBlood = BWContentHandler.Instance.bwAssets.GetConfig<bool>("Levels 1-3: Level up on enemy blood").Value;
+            canUsePlayerBlood = BWContentHandler.Instance.bwAssets.GetConfig<bool>("Levels 1-3: Level up on player damage blood").Value;
+            canMonstGoOutside = BWContentHandler.Instance.bwAssets.GetConfig<bool>("Level 4: Can monster go outside?").Value;
+            canGrannyGoOutside = BWContentHandler.Instance.bwAssets.GetConfig<bool>("Levels 1-3: Consume outside blood").Value;
+            granny1to2base = BWContentHandler.Instance.bwAssets.GetConfig<int>("Levels 1-2: Granny base speed").Value;
+            granny3base = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 3: Speed of granny").Value;
+            monsterBaseSpeed = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 4: Base monster speed").Value;
+            monsterMaxSpeed = BWContentHandler.Instance.bwAssets.GetConfig<int>("Level 4: Max monster speed").Value;
+            limbHealth = BWContentHandler.Instance.bwAssets.GetConfig<int>("Levels 1-3: Limb health").Value;
+            limbRegenDuration = BWContentHandler.Instance.bwAssets.GetConfig<float>("Levels 1-3: Limb regeneration duration").Value;
+
             updatePositionThreshold = 0.5f;
             ApplyLevelMaterials(CurrentLevel);
             
@@ -300,9 +346,6 @@ namespace BloodWitch
             currentBehaviourStateIndex = 1;
 
             boil2DAudioSource = gameObject.AddComponent<AudioSource>();
-            boil2DAudioSource.spatialBlend = 0f; // 2D Audio
-            boil2DAudioSource.loop = true;
-            boil2DAudioSource.volume = 1f;
             boil2DAudioSource.clip = boilTarget2DSFX;
             enemyRandom = new System.Random(StartOfRound.Instance.randomMapSeed + this.thisEnemyIndex);
             List<Material> combinedMaterials = new List<Material>();
@@ -404,13 +447,13 @@ namespace BloodWitch
                 {
                     case State.GrannyLevel1:
                     case State.GrannyLevel2:
-                        agent.speed = 3f; // Level 2 is same speed as level 1
+                        agent.speed = granny1to2base;
                         break;
                     case State.GrannyLevel3:
-                        agent.speed = 4f; // Faster in level 3
+                        agent.speed = granny3base;
                         break;
                     case State.MonsterLevel4:
-                        agent.speed = 4f; // Fast blood beast starts slow
+                        // Handled in Update method where currentMonsterSpeed is clamped and applied
                         break;
                 }
             }
@@ -419,6 +462,7 @@ namespace BloodWitch
             {
                 if (level == 4 && targetPlayer.isInsideFactory == this.isOutside)
                 {
+                    //reused and adapted from observerAI
                     movingTowardsTargetPlayer = false;
                     EntranceTeleport chaserDoor = GetClosestDoorToMonster();
                     if (chaserDoor != null)
@@ -448,13 +492,19 @@ namespace BloodWitch
 
                     if (level == 3 && !leftArmMissing) 
                     {
-                        if (explosionTimer == 0f && creatureAnimator != null)
+                        if (explosionTimer <= 0f)
                         {
-                            LogIfDebugBuild($"Started boiling player {targetPlayer.playerUsername}");
-                            SyncBoilingAnimationClientRpc(true, false);
+                            if (creatureAnimator != null)
+                            {
+                                LogIfDebugBuild($"Started boiling player {targetPlayer.playerUsername}");
+                                SyncBoilingAnimationClientRpc(true, false);
+                            }
+                            lastBoilTime = Time.time;
                         }
 
-                        explosionTimer += 0.2f;
+                        explosionTimer += (Time.time - lastBoilTime);
+                        lastBoilTime = Time.time;
+
                         SyncBoilTargetClientRpc((int)targetPlayer.playerClientId, explosionTimer);
 
                         if (explosionTimer >= explosionThreshold) 
@@ -464,9 +514,9 @@ namespace BloodWitch
                             targetPlayer.isSinking = false;
                         }
 
-                        if (explosionTimer >= explosionThreshold + 2f) // Explosion takes 2 seconds
+                        if (explosionTimer >= explosionThreshold)
                         {
-                            LogIfDebugBuild($"DoAIInterval: Exploding player {targetPlayer.playerUsername}");
+                            LogIfDebugBuild($"Exploding player {targetPlayer.playerUsername}");
                             ExplodePlayer(targetPlayer);
                             targetPlayer = null;
                             explosionTimer = 0f;
@@ -481,7 +531,7 @@ namespace BloodWitch
                         {
                             LogIfDebugBuild($"Casting Geyser on player {targetPlayer.playerUsername}");
                             CastBloodGeyser(targetPlayer);
-                            geyserCooldown = 10f;
+                            geyserCooldown = geyserCooldownThreshold;
                         }
                     }
 
@@ -551,6 +601,7 @@ namespace BloodWitch
                 if (level == 4 && doorTransitionCooldown <= 0f)
                 {
                     EntranceTeleport chaserDoor = GetClosestDoorToMonster();
+                    //if monster walks within 4 units of entrance
                     if (chaserDoor != null && Vector3.Distance(transform.position, chaserDoor.transform.position) < 4f)
                     {
                         // 30% chance to go through the door when wandering near it to avoid constant ping-ponging
@@ -584,6 +635,13 @@ namespace BloodWitch
         public override void Update()
         {
             base.Update();
+            
+            if (StartOfRound.Instance != null && StartOfRound.Instance.shipIsLeaving && !isShipLeavingHandled)
+            {
+                isShipLeavingHandled = true;
+                HandleShipLeft();
+            }
+
             if (isEnemyDead) return;
 
             if (stunNormalizedTimer > 0f)
@@ -631,7 +689,7 @@ namespace BloodWitch
                 consumeCoroutine = StartCoroutine(TeleportThenConsumeRoutine());
             }
 
-            if (currentBehaviourStateIndex == 3)
+            if (currentBehaviourStateIndex == 3) //This is monster level, which works as 0,1,2,3 instead of level int 1,2,3,4
             {
                 if (IsServer && agent != null && agent.isOnNavMesh && !isPausedAfterAttack && !isCurrentlyTransforming)
                 {
@@ -645,7 +703,7 @@ namespace BloodWitch
                         currentMonsterSpeed -= Time.deltaTime * 4f; // Slow down if no target
                         agent.acceleration = Mathf.MoveTowards(agent.acceleration, 10f, Time.deltaTime * 8f);
                     }
-                    currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, 2f, 9f);
+                    currentMonsterSpeed = Mathf.Clamp(currentMonsterSpeed, monsterBaseSpeed, monsterMaxSpeed);
                     agent.speed = currentMonsterSpeed;
                 }
                 
@@ -672,7 +730,10 @@ namespace BloodWitch
 
             timeSinceLastAttack += Time.deltaTime;
             chosenBloodTimer -= Time.deltaTime;
-            teleportCooldownTimer -= Time.deltaTime;
+            if (!isConsumingBlood && !isWalkingIntoPortal && !isCurrentlyTransforming)
+            {
+                teleportCooldownTimer -= Time.deltaTime;
+            }
             geyserCooldown -= Time.deltaTime;
             laughCooldown -= Time.deltaTime;
 
@@ -748,6 +809,13 @@ namespace BloodWitch
 
                             if (i == 0 && bloodOrb != null) bloodOrb.SetActive(true);
                             if (i == 1 && dagger != null) dagger.SetActive(true);
+                            if (i == 2 && CurrentLevel >= 2 && level2EyeEffects != null)
+                            {
+                                foreach (var eye in level2EyeEffects)
+                                {
+                                    if (eye != null) eye.SetActive(true);
+                                }
+                            }
 
                             if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
                             {
@@ -771,7 +839,7 @@ namespace BloodWitch
                         {
                             if (removableLimbs[i] != null && removableLimbs[i].renderers != null)
                             {
-                                float progress = 1f - (limbRegenTimers[i] / limbRegenDuration);
+                                float progress = limbRegenDuration > 0f ? 1f - (limbRegenTimers[i] / limbRegenDuration) : 1f;
                                 foreach (var r in removableLimbs[i].renderers)
                                 {
                                     if (r != null && r.materials != null)
@@ -820,8 +888,9 @@ namespace BloodWitch
             }
         }
 
+        //container to interact witrh specific consume routine
         private Coroutine consumeCoroutine;
-
+ 
         private System.Collections.IEnumerator TeleportThenConsumeRoutine()
         {
             isConsumingBlood = true; // Pauses AI immediately
@@ -917,7 +986,7 @@ namespace BloodWitch
                 }
             }
 
-            if (StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
+            if (canUsePlayerBlood && StartOfRound.Instance != null && StartOfRound.Instance.allPlayerScripts != null)
             {
                 foreach (PlayerControllerB p in StartOfRound.Instance.allPlayerScripts)
                 {
@@ -936,21 +1005,24 @@ namespace BloodWitch
                 }
             }
 
-            if (EnemyBloodPatch.enemyBloodDrops != null)
+            if (canUseEnemyBlood)
             {
-                foreach (GameObject eBlood in EnemyBloodPatch.enemyBloodDrops)
+                if (EnemyBloodPatch.enemyBloodDrops != null)
                 {
-                    if (eBlood != null) CheckSource(eBlood.transform);
-                }
-            }
-
-            if (RoundManager.Instance != null && RoundManager.Instance.SpawnedEnemies != null)
-            {
-                foreach (EnemyAI enemy in RoundManager.Instance.SpawnedEnemies)
-                {
-                    if (enemy != null && enemy != this && enemy.isEnemyDead)
+                    foreach (GameObject eBlood in EnemyBloodPatch.enemyBloodDrops)
                     {
-                        CheckSource(enemy.transform);
+                        if (eBlood != null) CheckSource(eBlood.transform);
+                    }
+                }
+
+                if (RoundManager.Instance != null && RoundManager.Instance.SpawnedEnemies != null)
+                {
+                    foreach (EnemyAI enemy in RoundManager.Instance.SpawnedEnemies)
+                    {
+                        if (enemy != null && enemy != this && enemy.isEnemyDead)
+                        {
+                            CheckSource(enemy.transform);
+                        }
                     }
                 }
             }
@@ -992,7 +1064,9 @@ namespace BloodWitch
                     }
                 }
                 
-                if (RoundManager.Instance.outsideAINodes != null)
+                bool canUseOutsideNodes = (CurrentLevel < 4 && canGrannyGoOutside) || (CurrentLevel == 4 && canMonstGoOutside);
+
+                if (canUseOutsideNodes && RoundManager.Instance.outsideAINodes != null)
                 {
                     foreach (GameObject node in RoundManager.Instance.outsideAINodes)
                     {
@@ -1025,17 +1099,31 @@ namespace BloodWitch
 
             if (closestNode != null)
             {
-                teleportCooldownTimer = (CurrentLevel >= 2) ? 30f : 15f; // cooldown for level 2 and 3
+                if (CurrentLevel == 3) teleportCooldownTimer = Level3TPCooldown;
+                else if (CurrentLevel == 2) teleportCooldownTimer = Level2TPCooldown;
+                else teleportCooldownTimer = Level1TPCooldown;
                 chosenTeleportNode = closestNode.transform.position;
-                LogIfDebugBuild($"Found closest node at {minDistance} units. Teleporting near blood area.");
-                if (IsServer)
+                
+                Vector3 finalTeleportPos = bloodLocation;
+                if (UnityEngine.AI.NavMesh.SamplePosition(bloodLocation, out UnityEngine.AI.NavMeshHit hit, 3f, UnityEngine.AI.NavMesh.AllAreas))
                 {
-                    if (portalCoroutine != null) StopCoroutine(portalCoroutine);
-                    portalCoroutine = StartCoroutine(PortalSequenceRoutine(bloodLocation, nodeIsOutside));
+                    finalTeleportPos = hit.position;
                 }
                 else
                 {
-                    TeleportBWServerRpc(bloodLocation, nodeIsOutside);
+                    LogIfDebugBuild("Blood not on navmesh, chosing another spot");
+                    finalTeleportPos = closestNode.transform.position;
+                }
+
+                LogIfDebugBuild($"Found closest node at {minDistance} units. Teleporting ontop of blood.");
+                if (IsServer)
+                {
+                    if (portalCoroutine != null) StopCoroutine(portalCoroutine);
+                    portalCoroutine = StartCoroutine(PortalSequenceRoutine(finalTeleportPos, nodeIsOutside));
+                }
+                else
+                {
+                    TeleportBWServerRpc(finalTeleportPos, nodeIsOutside);
                 }
             }
             else
@@ -1056,6 +1144,8 @@ namespace BloodWitch
                 entrancePortal = Instantiate(portalPrefab, position, rotation);
                 ParticleSystem[] particles = entrancePortal.GetComponentsInChildren<ParticleSystem>();
                 foreach (var p in particles) p.Play();
+                UnityEngine.VFX.VisualEffect[] vfx = entrancePortal.GetComponentsInChildren<UnityEngine.VFX.VisualEffect>();
+                foreach (var v in vfx) v.Play();
             }
             if (portalStartSFX != null && creatureVoice != null)
             {
@@ -1071,6 +1161,8 @@ namespace BloodWitch
                 exitPortal = Instantiate(portalPrefab, position, rotation);
                 ParticleSystem[] particles = exitPortal.GetComponentsInChildren<ParticleSystem>();
                 foreach (var p in particles) p.Play();
+                UnityEngine.VFX.VisualEffect[] vfx = exitPortal.GetComponentsInChildren<UnityEngine.VFX.VisualEffect>();
+                foreach (var v in vfx) v.Play();
             }
         }
 
@@ -1117,7 +1209,7 @@ namespace BloodWitch
             TeleportBWClientRpc(bloodLocation, setOutside);
             isWalkingIntoPortal = false;
 
-            yield return new WaitForSeconds(1f);
+            yield return new WaitForSeconds(2f);
             ClosePortalsClientRpc();
         }
 
@@ -1186,6 +1278,11 @@ namespace BloodWitch
             {
                 creatureVoice.PlayOneShot(transformationSFX);
             }
+            if (transformationSFXDistant != null && distantScreamAudioSource != null)
+            {
+                distantScreamAudioSource.clip = transformationSFXDistant;
+                distantScreamAudioSource.Play();
+            }
             yield return new WaitForSeconds(3f);
             
             if (BloodSpurtParticleBackL != null) BloodSpurtParticleBackL.Play();
@@ -1223,6 +1320,10 @@ namespace BloodWitch
                 bloodConsumed++;
                 int newLevel = CurrentLevel;
                 ConsumeBloodClientRpc(bloodConsumed, oldLevel, newLevel);
+
+                if (newLevel == 3) teleportCooldownTimer = Level3TPCooldown;
+                else if (newLevel == 2) teleportCooldownTimer = Level2TPCooldown;
+                else teleportCooldownTimer = Level1TPCooldown;
             }
         }
 
@@ -1242,6 +1343,11 @@ namespace BloodWitch
             {
                 int index = UnityEngine.Random.Range(0, levelUpScreams.Length);
                 screamAudioSource.PlayOneShot(levelUpScreams[index]);
+                if (levelUpScreamsDistant != null && levelUpScreamsDistant.Length > index && distantScreamAudioSource != null)
+                {
+                    distantScreamAudioSource.clip = levelUpScreamsDistant[index];
+                    distantScreamAudioSource.Play();
+                }
             }
         }
 
@@ -1416,18 +1522,39 @@ namespace BloodWitch
                 if (IsServer) PlayHitSFXClientRpc();
             }
 
-            if (removableLimbs != null)
+            if (IsServer && removableLimbs != null)
             {
-                List<int> attachedIndices = new List<int>();
-                for (int i = 0; i < isLimbDetached.Length; i++)
+                currentLimbDamage += force;
+                if (currentLimbDamage >= limbHealth)
                 {
-                    if (!isLimbDetached[i]) attachedIndices.Add(i);
-                }
+                    currentLimbDamage = 0;
+                    List<int> attachedIndices = new List<int>();
+                    for (int i = 0; i < isLimbDetached.Length; i++)
+                    {
+                        if (!isLimbDetached[i]) attachedIndices.Add(i);
+                    }
 
-                if (attachedIndices.Count > 0)
-                {
-                    int indexToDetach = attachedIndices[0];
-                    DetachLimbServerRpc(indexToDetach);
+                    if (attachedIndices.Count > 0)
+                    {
+                    List<int> selectableIndices = new List<int>();
+                    
+                    if (attachedIndices.Contains(0) || attachedIndices.Contains(1))
+                    {
+                        if (attachedIndices.Contains(0)) selectableIndices.Add(0);
+                        if (attachedIndices.Contains(1)) selectableIndices.Add(1);
+                    }
+                    else if (attachedIndices.Contains(2))
+                    {
+                        selectableIndices.Add(2);
+                    }
+                    else if (attachedIndices.Contains(3))
+                    {
+                        selectableIndices.Add(3);
+                    }
+
+                    int indexToDetach = selectableIndices[UnityEngine.Random.Range(0, selectableIndices.Count)];
+                    DetachLimbClientRpc(indexToDetach);
+                    }
                 }
             }
         }
@@ -1452,7 +1579,17 @@ namespace BloodWitch
             // Play blood spurt particles
             if (limbIndex == 0 && BloodSpurtParticleArmL != null) BloodSpurtParticleArmL.Play();
             else if (limbIndex == 1 && BloodSpurtParticleArmR != null) BloodSpurtParticleArmR.Play();
-            else if (limbIndex == 2 && BloodSpurtParticleHead != null) BloodSpurtParticleHead.Play();
+            else if (limbIndex == 2)
+            {
+                if (BloodSpurtParticleHead != null) BloodSpurtParticleHead.Play();
+                if (level2EyeEffects != null)
+                {
+                    foreach (var eye in level2EyeEffects)
+                    {
+                        if (eye != null) eye.SetActive(false);
+                    }
+                }
+            }
             else if (limbIndex == 3)
             {
                 if (BloodSpurtParticleBackL != null) BloodSpurtParticleBackL.Play();
@@ -1473,6 +1610,14 @@ namespace BloodWitch
                     if (rb == null) rb = severedLimb.AddComponent<Rigidbody>();
                     rb.isKinematic = false;
                     rb.useGravity = true;
+
+                    ParticleSystem[] particles = severedLimb.GetComponentsInChildren<ParticleSystem>();
+                    foreach (var p in particles) p.Play();
+                    
+                    UnityEngine.VFX.VisualEffect[] vfx = severedLimb.GetComponentsInChildren<UnityEngine.VFX.VisualEffect>();
+                    foreach (var v in vfx) v.Play();
+
+                    Destroy(severedLimb, 20f);
                 }
 
                 foreach (var r in removableLimbs[limbIndex].renderers)
@@ -1566,7 +1711,7 @@ namespace BloodWitch
             if (isEnemyDead || isConsumingBlood) return;
 
             PlayerControllerB player = MeetsStandardPlayerCollisionConditions(other);
-            if (player != null && timeSinceLastAttack >= 1f)
+            if (player != null && timeSinceLastAttack >= grannyAttackCooldownThreshold)
             {
                 // Index 1 = right arm
                 if (removableLimbs != null && isLimbDetached != null && isLimbDetached.Length > 1 && isLimbDetached[1])
@@ -1720,6 +1865,32 @@ namespace BloodWitch
             if (creatureVoice != null) creatureVoice.Stop();
             if (creatureSFX != null) creatureSFX.Stop();
             if (boil2DAudioSource != null) boil2DAudioSource.Stop();
+
+            if (removableLimbs != null)
+            {
+                for (int i = 0; i < removableLimbs.Length; i++)
+                {
+                    if (isLimbDetached != null && isLimbDetached.Length > i && isLimbDetached[i] && removableLimbs[i] != null && removableLimbs[i].renderers != null)
+                    {
+                        foreach (var r in removableLimbs[i].renderers)
+                        {
+                            if (r != null && r.materials != null)
+                            {
+                                foreach (Material mat in r.materials)
+                                {
+                                    if (mat.HasProperty("_AlphaCutoff")) mat.SetFloat("_AlphaCutoff", 1f);
+                                    if (mat.HasProperty("_Color")) 
+                                    {
+                                        Color c = mat.color;
+                                        c.a = 0f;
+                                        mat.color = c;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (screamAudioSource != null) screamAudioSource.Stop();
         }
 
@@ -1817,8 +1988,8 @@ namespace BloodWitch
                     boil2DAudioSource.Play();
                 }
                 
-                // Pitch goes up as explosionTimer reaches explosionThreshold + 2f
-                float maxTime = explosionThreshold + 2f;
+                // Pitch goes up as explosionTimer reaches explosionThreshold
+                float maxTime = explosionThreshold;
                 float progress = Mathf.Clamp01(explosionTimerValue / maxTime);
                 boil2DAudioSource.pitch = 1f + (progress * 1.5f); // Pitch from 1.0 to 2.5
             }
@@ -1915,6 +2086,39 @@ namespace BloodWitch
                     door.entrancePointAudio.PlayOneShot(door.doorAudios[0]);
                 }
             }
+        }
+
+        private void HandleShipLeft()
+        {
+            LogIfDebugBuild("Ship is leaving! Cleaning up BloodWitch.");
+
+            if (creatureVoice != null) creatureVoice.Stop();
+            if (daggerAudioSource != null) daggerAudioSource.Stop();
+            if (breathingAudioSource != null) breathingAudioSource.Stop();
+            if (screamAudioSource != null) screamAudioSource.Stop();
+            if (distantScreamAudioSource != null) distantScreamAudioSource.Stop();
+            if (boil2DAudioSource != null) boil2DAudioSource.Stop();
+
+            if (entrancePortal != null) Destroy(entrancePortal);
+            if (exitPortal != null) Destroy(exitPortal);
+
+            if (bloodOrb != null) bloodOrb.SetActive(false);
+
+            KillEnemy(true);
+        }
+
+        public override void OnDestroy()
+        {
+            base.OnDestroy();
+
+            if (creatureVoice != null) creatureVoice.Stop();
+            if (daggerAudioSource != null) daggerAudioSource.Stop();
+            if (breathingAudioSource != null) breathingAudioSource.Stop();
+            if (screamAudioSource != null) screamAudioSource.Stop();
+            if (distantScreamAudioSource != null) distantScreamAudioSource.Stop();
+            if (boil2DAudioSource != null) boil2DAudioSource.Stop();
+
+            LogIfDebugBuild("OnDestroy successful.");
         }
     }
 }
