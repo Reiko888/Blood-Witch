@@ -1063,7 +1063,6 @@ namespace BloodWitch
 
             if (canUseEnemyBlood)
             {
-                // Note: EnemyBloodPatch.enemyBloodDrops is now handled in the unified loop above
 
                 if (RoundManager.Instance != null && RoundManager.Instance.SpawnedEnemies != null)
                 {
