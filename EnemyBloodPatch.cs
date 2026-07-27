@@ -67,8 +67,8 @@ namespace BloodWitch
             // Add it to our tracking list
             enemyBloodDrops.Add(bloodDrop);
             
-            // Auto-destroy after 120 seconds so the list doesn't grow infinitely and stays visible longer
-            UnityEngine.Object.Destroy(bloodDrop, 120f);
+            BloodDropTimer timer = bloodDrop.AddComponent<BloodDropTimer>();
+            timer.lifetime = 120f;
 
             // Periodically clean up the list of any null/destroyed references
             enemyBloodDrops.RemoveAll(x => x == null);
@@ -144,8 +144,41 @@ namespace BloodWitch
             if (bloodDrop != null)
             {
                 BloodWitch.EnemyBloodPatch.enemyBloodDrops.Add(bloodDrop);
-                UnityEngine.Object.Destroy(bloodDrop, 60f); // Make sure it stays for 60 seconds
+                BloodDropTimer timer = bloodDrop.AddComponent<BloodDropTimer>();
+                timer.lifetime = 60f;
                 BloodWitch.EnemyBloodPatch.enemyBloodDrops.RemoveAll(x => x == null);
+            }
+        }
+    }
+
+    public class BloodDropTimer : MonoBehaviour
+    {
+        public float lifetime = 60f;
+        public bool isTargeted = false;
+
+        private void Update()
+        {
+            if (isTargeted) return;
+            lifetime -= Time.deltaTime;
+            if (lifetime <= 0f)
+            {
+                Destroy(gameObject);
+            }
+        }
+    }
+
+    public class SeveredLimbTimer : MonoBehaviour
+    {
+        public float lifetime = 20f;
+        public bool persistOnDeath = false;
+
+        private void Update()
+        {
+            if (persistOnDeath) return;
+            lifetime -= Time.deltaTime;
+            if (lifetime <= 0f)
+            {
+                Destroy(gameObject);
             }
         }
     }

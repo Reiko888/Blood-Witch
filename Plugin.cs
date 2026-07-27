@@ -16,7 +16,7 @@ namespace BloodWitch
     {
         public const string modGUID = "reiko888.BloodWitch";
         public const string modName = "Blood Witch";
-        public const string modVersion = "1.0.0";
+        public const string modVersion = "1.1.0";
 
         public static Plugin Instance = null!;
         internal static new ManualLogSource Logger = null!;
